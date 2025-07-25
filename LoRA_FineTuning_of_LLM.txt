@@ -1,0 +1,351 @@
+You got it\! Here's the complete Python script for fine-tuning an LLM with LoRA using your custom text file, along with instructions on how to run it.
+
+-----
+
+### `finetune_llm_lora.py`
+
+```python
+import pandas as pd
+from datasets import Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, TrainingArguments
+import torch
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType, PeftModel
+from trl import SFTTrainer
+from transformers import pipeline
+import os
+
+# --- Configuration Parameters ---
+# Adjust these based on your needs and hardware
+CUSTOM_DATA_FILE = "my_data.txt"
+BASE_MODEL_ID = "meta-llama/Llama-2-7b-hf" # Make sure you have access to this model on Hugging Face
+                                         # (e.g., Llama 2 requires approval)
+OUTPUT_DIR = "./lora_finetuned_model"
+FINAL_MERGED_MODEL_DIR = "./merged_finetuned_model_bf16" # Where the merged model will be saved
+
+# LoRA Configuration
+LORA_R = 16
+LORA_ALPHA = 32
+LORA_DROPOUT = 0.05
+# Target modules for Llama models. Adjust if using a different architecture.
+# To find for your model: print(model) after loading, look for linear layer names.
+LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj"] # For Llama
+# You might add: "gate_proj", "up_proj", "down_proj" for Llama's MLP layers
+
+# Training Arguments
+NUM_TRAIN_EPOCHS = 3
+PER_DEVICE_TRAIN_BATCH_SIZE = 4
+GRADIENT_ACCUMULATION_STEPS = 2 # Effective batch size = batch_size * gradient_accumulation_steps
+LEARNING_RATE = 2e-4
+MAX_SEQ_LENGTH = 512 # Max length of your instruction + response combined
+SAVE_STEPS = 500
+LOGGING_STEPS = 50
+REPORT_TO = "tensorboard" # Or "none", "wandb"
+
+# --- Step 1: Prepare Custom Data ---
+def parse_text_file(file_path):
+    """
+    Parses the custom text file into a list of dictionaries.
+    Expected format:
+    ### Instruction:
+    Your instruction here.
+
+    ### Response:
+    Your response here.
+    """
+    data = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        current_instruction = ""
+        current_response = ""
+        mode = None # 'instruction' or 'response'
+
+        for line in f:
+            line = line.strip()
+            if line.startswith("### Instruction:"):
+                if current_instruction and current_response:
+                    data.append({
+                        "instruction": current_instruction.strip(),
+                        "response": current_response.strip()
+                    })
+                current_instruction = line.replace("### Instruction:", "").strip()
+                current_response = ""
+                mode = 'instruction'
+            elif line.startswith("### Response:"):
+                current_response = line.replace("### Response:", "").strip()
+                mode = 'response'
+            elif mode == 'instruction':
+                current_instruction += " " + line
+            elif mode == 'response':
+                current_response += " " + line
+            # else: print(f"Skipping unformatted line: {line}") # Optional: for debugging data format
+
+        # Add the last entry if loop finishes and data is pending
+        if current_instruction and current_response:
+            data.append({
+                "instruction": current_instruction.strip(),
+                "response": current_response.strip()
+            })
+    return data
+
+print(f"--- 1. Preparing custom data from {CUSTOM_DATA_FILE} ---")
+parsed_data = parse_text_file(CUSTOM_DATA_FILE)
+if not parsed_data:
+    raise ValueError(f"No data parsed from {CUSTOM_DATA_FILE}. Please check file format.")
+
+df = pd.DataFrame(parsed_data)
+train_dataset = Dataset.from_pandas(df)
+print(f"Loaded {len(train_dataset)} examples for training.")
+print("Example data point:")
+print(train_dataset[0])
+
+# --- Step 2: Choose a Base LLM and Tokenizer ---
+print(f"--- 2. Loading base model '{BASE_MODEL_ID}' and tokenizer ---")
+tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right" # Important for generation
+
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.bfloat16,
+    bnb_4bit_use_double_quant=True,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    BASE_MODEL_ID,
+    quantization_config=bnb_config,
+    device_map="auto",
+    trust_remote_code=True,
+)
+
+model = prepare_model_for_kbit_training(model)
+print("Base model loaded and prepared for k-bit training.")
+
+# --- Step 3: Define LoRA Configuration ---
+print("--- 3. Setting up LoRA configuration ---")
+lora_config = LoraConfig(
+    r=LORA_R,
+    lora_alpha=LORA_ALPHA,
+    target_modules=LORA_TARGET_MODULES,
+    lora_dropout=LORA_DROPOUT,
+    bias="none",
+    task_type=TaskType.CAUSAL_LM,
+)
+
+model = get_peft_model(model, lora_config)
+model.print_trainable_parameters()
+print("LoRA adapters applied to the model.")
+
+# --- Step 4: Prepare the Dataset for Training (Formatting Function) ---
+# Define the formatting function for the SFTTrainer
+def formatting_prompts_func(example):
+    """
+    Formats the instruction and response into the LLM's expected prompt template.
+    For Llama 2 chat, it's typically: <s>[INST] instruction [/INST] response</s>
+    """
+    output_texts = []
+    for i in range(len(example['instruction'])):
+        text = f"<s>[INST] {example['instruction'][i]} [/INST] {example['response'][i]}</s>"
+        output_texts.append(text)
+    return output_texts
+
+print("--- 4. Data formatting function defined. ---")
+
+# --- Step 5: Define Training Arguments and SFTTrainer ---
+print("--- 5. Initializing SFTTrainer ---")
+training_arguments = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    num_train_epochs=NUM_TRAIN_EPOCHS,
+    per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
+    gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+    optim="paged_adamw_8bit",
+    save_steps=SAVE_STEPS,
+    logging_steps=LOGGING_STEPS,
+    learning_rate=LEARNING_RATE,
+    fp16=False, # QLoRA uses bfloat16 for compute, so False here
+    bf16=True, # Set to True if your GPU supports bfloat16 (recommended for Ampere+ GPUs)
+    max_grad_norm=0.3,
+    max_steps=-1,
+    warmup_ratio=0.03,
+    lr_scheduler_type="cosine",
+    report_to=REPORT_TO,
+    # evaluation_strategy="steps", # Uncomment and add eval_dataset if you have one
+    # eval_steps=SAVE_STEPS,
+)
+
+trainer = SFTTrainer(
+    model=model,
+    train_dataset=train_dataset,
+    peft_config=lora_config,
+    max_seq_length=MAX_SEQ_LENGTH,
+    tokenizer=tokenizer,
+    args=training_arguments,
+    formatting_func=formatting_prompts_func,
+    packing=True, # Pack multiple short examples into one sequence for efficiency
+)
+
+# --- Step 6: Start Training ---
+print("--- 6. Starting training... This will take a while! ---")
+trainer.train()
+print("Training complete.")
+
+# --- Step 7: Save the LoRA Adapters ---
+print(f"--- 7. Saving LoRA adapters to {OUTPUT_DIR} ---")
+trainer.save_model(OUTPUT_DIR)
+print("LoRA adapters saved.")
+
+# --- Step 8: Load and Merge for Inference ---
+print("--- 8. Loading base model and merging LoRA adapters for inference ---")
+
+# Load the base model again (can be in 4-bit or full precision, merging will result in higher precision)
+base_model_for_merge = AutoModelForCausalLM.from_pretrained(
+    BASE_MODEL_ID,
+    # No quantization_config here if you want to save a full (merged) model in FP16/BF16
+    # If you want to keep it 4-bit, you can re-apply bnb_config here
+    torch_dtype=torch.bfloat16, # Or torch.float16
+    device_map="auto",
+    trust_remote_code=True,
+)
+
+# Load the tokenizer (same as before)
+finetuned_tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID)
+if finetuned_tokenizer.pad_token is None:
+    finetuned_tokenizer.pad_token = finetuned_tokenizer.eos_token
+finetuned_tokenizer.padding_side = "right"
+
+# Load the LoRA adapters onto the base model
+model_to_merge = PeftModel.from_pretrained(base_model_for_merge, OUTPUT_DIR)
+
+# Merge LoRA weights into the base model. This creates a single model.
+print("Merging LoRA weights into the base model...")
+merged_model = model_to_merge.merge_and_unload()
+print("LoRA weights merged.")
+
+# Save the merged model and tokenizer
+print(f"Saving merged fine-tuned model to {FINAL_MERGED_MODEL_DIR}...")
+merged_model.save_pretrained(FINAL_MERGED_MODEL_DIR, safe_serialization=True)
+finetuned_tokenizer.save_pretrained(FINAL_MERGED_MODEL_DIR)
+print("Merged fine-tuned model and tokenizer saved.")
+
+# --- Step 9: Inference ---
+print("--- 9. Performing inference with the fine-tuned model ---")
+
+# Create a text generation pipeline
+generator = pipeline(
+    "text-generation",
+    model=merged_model, # Use the merged model
+    tokenizer=finetuned_tokenizer,
+    torch_dtype=torch.bfloat16, # Ensure correct dtype for generation
+    device_map="auto"
+)
+
+# Example inference
+instruction = "Tell me about the importance of clean water."
+# Format the instruction exactly as you did during training
+prompt = f"<s>[INST] {instruction} [/INST]"
+
+print(f"\nPrompt: {instruction}")
+print("\nGenerated Response:")
+
+try:
+    outputs = generator(
+        prompt,
+        max_new_tokens=200, # Increased tokens for a more substantial response
+        num_return_sequences=1,
+        do_sample=True,
+        temperature=0.7,
+        top_k=50,
+        top_p=0.95,
+        eos_token_id=finetuned_tokenizer.eos_token_id,
+        pad_token_id=finetuned_tokenizer.pad_token_id, # Ensure pad token is set for generation
+    )
+
+    generated_text = outputs[0]['generated_text']
+    # The generated text will contain the prompt, so you might need to extract the response part
+    # Find the end of the prompt and take the rest
+    response_start_index = generated_text.find("[/INST]") + len("[/INST]")
+    response = generated_text[response_start_index:].strip()
+    print(response)
+
+except Exception as e:
+    print(f"Error during inference: {e}")
+    print("This might happen if the model is still too large for your GPU even after merging,")
+    print("or if there's an issue with the prompt format/generation parameters.")
+    print("Consider reducing `max_new_tokens` or trying on a larger GPU.")
+```
+
+-----
+
+### How to Run the Code
+
+Follow these steps to execute the fine-tuning script:
+
+1.  **Save the Code:**
+    Save the entire Python code block above into a file named `finetune_llm_lora.py`.
+
+2.  **Create Your Data File:**
+    Create a text file named `my_data.txt` in the same directory as your Python script. Populate it with your custom data following the specified format:
+
+    ```
+    ### Instruction:
+    What is the capital of France?
+
+    ### Response:
+    The capital of France is Paris.
+
+    ### Instruction:
+    Who wrote "Romeo and Juliet"?
+
+    ### Response:
+    "Romeo and Juliet" was written by William Shakespeare.
+    ```
+
+    **Crucial:** Ensure there's a blank line between the end of one `Response:` and the start of the next `### Instruction:`.
+
+3.  **Install Dependencies:**
+    Open your terminal or command prompt and navigate to the directory where you saved the files. Then, install the necessary libraries:
+
+    ```bash
+    pip install -q -U bitsandbytes transformers peft accelerate datasets scipy trl
+    ```
+
+    *(Optional but recommended: If you want to use TensorBoard to monitor training, also install `tensorboard`: `pip install tensorboard`)*
+
+4.  **Hugging Face Access (for Llama 2):**
+    If you're using `meta-llama/Llama-2-7b-hf` or other gated models, you must:
+
+      * Visit the model page on Hugging Face Hub (e.g., [https://huggingface.co/meta-llama/Llama-2-7b-hf](https://huggingface.co/meta-llama/Llama-2-7b-hf)).
+      * Accept the terms and gain access.
+      * Log in to Hugging Face from your terminal:
+        ```bash
+        huggingface-cli login
+        ```
+        You'll be prompted to enter your Hugging Face token (you can find it in your Hugging Face settings under "Access Tokens").
+
+5.  **Run the Script:**
+    Execute the Python script from your terminal:
+
+    ```bash
+    python finetune_llm_lora.py
+    ```
+
+**Expected Output & What to Expect:**
+
+  * The script will first print messages about data parsing and model loading.
+  * You'll see a summary of trainable parameters (a very small percentage of the total).
+  * Training will begin, and you'll see logging messages periodically, showing loss and learning rate. This will take significant time depending on your GPU, model size, and dataset.
+  * Upon completion, it will save the LoRA adapters, merge them into the base model, and save the final merged model.
+  * Finally, it will perform an example inference using your newly fine-tuned model and print the generated response.
+
+**Troubleshooting & Tips:**
+
+  * **CUDA Out of Memory (OOM):** This is the most common issue.
+      * Reduce `PER_DEVICE_TRAIN_BATCH_SIZE`.
+      * Increase `GRADIENT_ACCUMULATION_STEPS` (to maintain effective batch size).
+      * Reduce `MAX_SEQ_LENGTH`.
+      * Ensure no other applications are consuming GPU memory.
+      * Consider a smaller base model.
+  * **Model ID / Access Issues:** Double-check the `BASE_MODEL_ID` and ensure you have access to it on Hugging Face.
+  * **Data Formatting:** Carefully review your `my_data.txt` file to ensure it exactly matches the `### Instruction:` and `### Response:` format expected by the `parse_text_file` function. Any deviation can lead to parsing errors or empty datasets.
+  * **GPU Support:** Ensure your PyTorch installation is configured to use CUDA and that your GPU drivers are up to date. You can check with `python -c "import torch; print(torch.cuda.is_available())"`.
+  * **`target_modules`:** If you switch to a different model architecture (e.g., Gemma, Falcon), the `LORA_TARGET_MODULES` might need to be adjusted. Print `print(model)` after loading the base model to inspect its layer names.
