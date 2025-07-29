@@ -1,0 +1,5 @@
+Serper.dev/signup
+Name: Machine Learning
+Email: machine.learning.tutorial@gmail.com
+PW: MachineLearningTutorial@12345
+API: 250c25fae94c058a794dac29637f79940a35b5c0
