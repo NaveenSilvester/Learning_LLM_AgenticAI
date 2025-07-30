@@ -1,0 +1,6 @@
+conda create -p venv python==3.10 -y
+create requirments.txt
+create a .env file
+update the .env file with all the api credentials
+
+
